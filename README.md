@@ -2,7 +2,7 @@
 C++ Mysql connection pool for linux, you can use it to manage mysql connection
 
 Example:
-'''cpp
+```cpp
 	MysqlConnectionPool *pool = new MysqlConnectionPool();
     int ret = 0;
     ret = pool->initMysqlConnPool("localhost", 3306, "username", "password", "mysql");
@@ -36,4 +36,4 @@ Example:
     }
     delete pool;
     return 0;
-'''
+```
