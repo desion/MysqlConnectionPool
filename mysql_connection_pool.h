@@ -31,7 +31,7 @@
 #ifndef __MYSQL_CONNECTION_POOL_H
 #define __MYSQL_CONNECTION_POOL_H
 
-#include <mysql.h>
+#include <mysql/mysql.h>
 #include <semaphore.h>
 #include <pthread.h>
 #include <deque>
@@ -40,9 +40,10 @@
 
 #define MAX_SETTING_STRING_LEN  256
 #define MAX_POOL_SIZE           256
-#define MAX_DATA_LEN            1024*100
 
-#define conn_fetch_row(conn) mysql_fetch_row((conn)->res)
+#define MCP_LOG(fmt, ...) {\
+    fprintf(stderr, fmt, ##__VA_ARGS__);\
+}
 
 /* mysql connection setting option. */
 typedef struct {
@@ -51,71 +52,51 @@ typedef struct {
    char database[MAX_SETTING_STRING_LEN];
    char user[MAX_SETTING_STRING_LEN];
    char password[MAX_SETTING_STRING_LEN];
+   char charset[MAX_SETTING_STRING_LEN];
    unsigned int  timeout;
 } connectionSetting;
 
 /* mysql connection struct */
 typedef struct {
-    ConnectionSetting   *ptrConnSetting;
+    connectionSetting   *ptrConnSetting;
     MYSQL               *sock;
     MYSQL               mysql;
-    MYSQL_RES           *res;
+    int                 res;
 } mysqlConnection;
 
 
 class MysqlConnectionPool{
 public:
-    //初始化连接池
-    bool init(const char* section, const char* conf);
+    /* init the connection pool */
+    int initMysqlConnPool(const char* host,int port,const char* user,const char* password,const char* database);
     /* recycle the connection to pool. */
-    void recycleConnection(mysqlConnection *conn){
-        conn_free_result(conn);
-    }
-    //查询
-    int mysqlQuery(MysqlConnection *conn,char *sql, int *lockTime, unsigned int id);
+    void recycleConnection(mysqlConnection *conn);
+    /* execute the mysql query */
+    int executeSql(mysqlConnection *conn, const char* sql);
     /* fetch the connection from the pool. */
-    mysqlConnection *fetchConnection(){
-        return connpool_getConn();
-    }
-    //迭代结果
-    MysqlConnection* conn_next_result(MysqlConnection *conn);
+    mysqlConnection *fetchConnection();
+    /* open mysql connection pool with connection num is coreConnNum */
+    int openConnPool(int coreConnNum);
+    /* set the charset of connection */
+    void setCharsetOption(connectionSetting *connSetting, const char* charset);
 
 public:
     MysqlConnectionPool(){
     }
 
     ~MysqlConnectionPool(){
-        poolDestroy();
+        closeConnPool();
     }
 private:
-    void poolDestroy(){
-        connpool_close();
-    }
-    //创建连接池
-    int openConnPool(int connNum);
-    //关闭连接池
+    int lockPool();
+    /* close connection pool*/
     void closeConnPool();
-    //执行sql，被conn_new_result内部调用
-    MYSQL_RES *mysql_new_result(MYSQL *sock,char *sql, char* database, unsigned int id);
-    //回收连接
-    void conn_free_result(MysqlConnection *conn);
-    //获取连接
-    MysqlConnection *connpool_getConn();
-    //通过配置打开连接
-    void conn_open(MysqlConnection* conn, ConnectionSetting *s);
-    //关闭连接
-    void conn_close(MysqlConnection* conn);
-    int conn_lock();
-    //初始化mysql连接池配置
-    int init_mysql(const char* section, const char* mysql_conf);
 private:
     int  connNum; // Number of connections
     sem_t  sem;
     std::deque<mysqlConnection*> connPool;
-    //配置管理
     connectionSetting *connSetting;
-    //全局锁
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mutex;
 };
 
 #endif

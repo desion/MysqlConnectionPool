@@ -2,75 +2,67 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <string.h>
 #include <errno.h>
 #include <assert.h>
 
 #include "mysql_connection_pool.h"
 
-int MysqlConnectionPool::openConnPool(int connNum) {
-    if (connNum > MAX_POOL_SIZE) {connNum = MAX_POOL_SIZE;}
+int MysqlConnectionPool::openConnPool(int coreConnNum) {
+    if (coreConnNum > MAX_POOL_SIZE || coreConnNum <= 0){
+        coreConnNum = MAX_POOL_SIZE;
+    }
     pthread_mutex_init(&mutex, NULL);
 
-    connNum = connNum;
+    connNum = coreConnNum;
     sem_init(&sem, 0, connNum);
 
-    for (int i=0; i<connNum; i++) {
+    for (int i = 0; i < connNum; i++) {
         mysqlConnection *conn = new mysqlConnection;
-        conn->pConnSetting = conn_setting;
+        conn->ptrConnSetting = connSetting;
 
         if (mysql_init(&conn->mysql) == NULL) {
-                LOG_ERROR("ERROR: mysql_init() %s\n", mysql_error(&conn->mysql));
-                return 1;
-            }
-
-        mysql_options(&conn->mysql,MYSQL_OPT_CONNECT_TIMEOUT,&conn_setting->timeout);
-        mysql_options(&conn->mysql,MYSQL_OPT_READ_TIMEOUT,&conn_setting->timeout);
-        mysql_options(&conn->mysql,MYSQL_SET_CHARSET_NAME, "utf8mb4");
-
-        conn->sock=mysql_real_connect(&conn->mysql,conn_setting->host,
-            conn_setting->user, conn_setting->password, conn_setting->database, conn_setting->port, NULL, CLIENT_MULTI_STATEMENTS);
-
-        LOG_INFO("Mysql\tHost:%s User:%s Password:%s DataBase:%s Port:%d", conn_setting->host, conn_setting->user, conn_setting->password, conn_setting->database, conn_setting->port);
-        if (!conn->sock) {
-            LOG_ERROR("ERROR mysql_real_connect(): %s\n", mysql_error(& conn->mysql) );
+            MCP_LOG("ERROR: mysql_init() %s\n", mysql_error(&conn->mysql));
             return 1;
         }
-        conn->res=NULL;
-            connPool.push_back(conn);
-    }
 
+        mysql_options(&conn->mysql,MYSQL_OPT_CONNECT_TIMEOUT,&connSetting->timeout);
+        mysql_options(&conn->mysql,MYSQL_OPT_READ_TIMEOUT,&connSetting->timeout);
+        mysql_options(&conn->mysql,MYSQL_SET_CHARSET_NAME, connSetting->charset);
+
+        conn->sock = mysql_real_connect(&conn->mysql, connSetting->host,
+                connSetting->user, connSetting->password, connSetting->database, connSetting->port, NULL, CLIENT_MULTI_STATEMENTS);
+
+        if (!conn->sock) {
+            MCP_LOG("ERROR mysql_real_connect(): %s\n", mysql_error(& conn->mysql));
+            return 1;
+        }
+        connPool.push_back(conn);
+    }
     return 0;
 }
-void MysqlManager::connpool_close() {
+
+void MysqlConnectionPool::closeConnPool() {
     pthread_mutex_destroy(&mutex);
-    std::deque<MysqlConnection*>::iterator iter;
+    std::deque<mysqlConnection*>::iterator iter;
     for(iter = connPool.begin(); iter != connPool.end(); ++iter){
-       MysqlConnection *conn = *iter;
+        mysqlConnection *conn = *iter;
 
-       if (conn->res!=NULL) {
-          mysql_free_result(conn->res);
-          conn->res = NULL;
-       }
-       if (conn->sock!=NULL) {
-           mysql_close(conn->sock);
-           conn->sock=NULL;
-       }
+        if (conn->sock!=NULL) {
+            mysql_close(conn->sock);
+            conn->sock=NULL;
+        }
+        delete conn;
     }
-
     connPool.clear();
-
     sem_destroy(&sem);
-
-    free(conn_setting);
+    free(connSetting);
 }
 
-/***
-* 生成者消费者锁的实现
-*/
-int MysqlManager::conn_lock() {
+int MysqlConnectionPool::lockPool() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-       LOG_INFO("Function clock_gettime failed");
+       MCP_LOG("Function clock_gettime failed");
        return -1;
     }
 
@@ -80,113 +72,68 @@ int MysqlManager::conn_lock() {
         continue;       // Restart when interrupted by handler
     if (ret==-1) {
         if (errno == ETIMEDOUT) {
-            LOG_WARN( "Timeout occurred in locking connection, \
+            MCP_LOG( "Timeout occurred in locking connection, \
                 database is, pool connNum is %d",
                 connNum);
         }
         else {
-           LOG_WARN( "Unknown error in locking connection, \
+           MCP_LOG( "Unknown error in locking connection, \
                 database is, pool connNum is %d",
                 connNum);
         }
-return -2;
+        return -2;
     }
     return 0;
 }
-/***
-* 获取mysql连接
-*/
-MysqlConnection * MysqlManager::connpool_getConn() {
-    if (conn_lock() != 0) {return NULL;}
+
+mysqlConnection* MysqlConnectionPool::fetchConnection() {
+    if (lockPool() != 0) {
+        return NULL;
+    }
     pthread_mutex_lock(&mutex);
 
-    MysqlConnection* conn = connPool.front();
+    mysqlConnection* conn = connPool.front();
     connPool.pop_front();
 
     pthread_mutex_unlock(&mutex);
     return conn;
 }
 
-MYSQL_RES * MysqlManager::mysql_new_result(MYSQL *sock, char *sql, char* database, unsigned int id) {
-    MYSQL_RES *res;
-
-    if (sock == NULL || sql == NULL) {
-        return NULL;
+int MysqlConnectionPool::executeSql(mysqlConnection *conn, const char* sql) {
+    if(NULL == conn || NULL == sql){
+        return 1;
     }
-
-    if(mysql_query(sock,sql)) {
-        LOG_WARN( "Failed in mysql_query, Error: %s\n", mysql_error(sock));
-        LOG_WARN( "Failed in mysql_query, sql is %s, database is %s, id is %u\n", sql, database, id);
-        return NULL;
-    }
-    if(mysql_errno(sock) != 0){
-        LOG_WARN( "Failed in mysql_query, Error: %s\n", mysql_error(sock));
-        return NULL;
-    }
-
-    if (!(res=mysql_store_result(sock))) {
-        LOG_WARN( "Failed in mysql_store_result, Error: %s\n", mysql_error(sock));
-        return NULL;
-    }
-
-    return res;
-}
-
-int MysqlManager::mysqlquery(MysqlConnection *conn,char sql[],int *lockTime, unsigned int id) {
-    if (lockTime!=NULL) {*lockTime=time(NULL);}
-
     if (conn->sock) {
-        conn->res = mysql_new_result(conn->sock,sql, conn->pConnSetting->database, id);
+        conn->res = mysql_query(conn->sock, sql);
     } else {
-        conn->res = NULL;
+        conn->res = 1;
     }
-    //进行重连
-    if (conn->res == NULL) {
+    //reconnect
+    if (conn->res) {
         mysql_close(conn->sock);
         mysql_init(&(conn->mysql));
 
-        ConnectionSetting *s=conn->pConnSetting;
+        connectionSetting *s = conn->ptrConnSetting;
         mysql_options(&conn->mysql,MYSQL_OPT_CONNECT_TIMEOUT,&s->timeout);
         mysql_options(&conn->mysql,MYSQL_OPT_READ_TIMEOUT,&s->timeout);
-        mysql_options(&conn->mysql,MYSQL_SET_CHARSET_NAME, "utf8mb4");
+        mysql_options(&conn->mysql,MYSQL_SET_CHARSET_NAME, s->charset);
 
         conn->sock=mysql_real_connect(&(conn->mysql),
                 s->host, s->user, s->password, s->database, s->port, NULL, CLIENT_MULTI_STATEMENTS);
 
         if (!conn->sock) {
-            LOG_WARN("Failed to connect to database: Error: %s, database is %s, id is %u\n",
-                mysql_error(& conn->mysql), conn->pConnSetting->database, id);
+            MCP_LOG("Failed to connect to database: Error: %s, database is %s\n",
+                mysql_error(& conn->mysql), conn->ptrConnSetting->database);
         }
 
-        conn->res = mysql_new_result(conn->sock, sql, conn->pConnSetting->database, id);
+        conn->res = mysql_query(conn->sock, sql);
     }
 
-    if (conn->res) {
-        return 1 ;
-    } else {
-       return  0;
-    }
-}
-/***
-* 迭代结果
-*/
-MysqlConnection* MysqlManager::conn_next_result(MysqlConnection *conn) {
-   if (conn->res !=NULL ) {
-       mysql_free_result(conn->res);
-       conn->res = NULL;
-   }
-
-   if (0 != mysql_next_result(conn->sock)) return NULL;
-   conn->res = mysql_store_result(conn->sock);
-   return conn;
+    return conn->res;
 }
 
-void MysqlManager::conn_free_result(MysqlConnection *conn) {
-   if (conn->res !=NULL ) {
-       mysql_free_result(conn->res);
-       conn->res = NULL;
-   }
-
+//recycle connection
+void MysqlConnectionPool::recycleConnection(mysqlConnection *conn) {
    pthread_mutex_lock(&mutex);
 
    connPool.push_back(conn);
@@ -197,48 +144,48 @@ void MysqlManager::conn_free_result(MysqlConnection *conn) {
    return ;
 }
 
-/***
-* 连接池管理初始化
-*/
-bool MysqlManager::init(const char* section, const char* mysql_conf){
-    if(init_mysql(section, mysql_conf) != 0){
-        return false;
-    }
-    return true;
-}
-
 
 //初始化mysql
-int MysqlManager::init_mysql(const char* section, const char* mysql_conf){
-    int pool_num = 10;
-    conn_setting = (ConnectionSetting*)malloc(sizeof(ConnectionSetting));
-    assert(conn_setting != NULL);
-    if(!read_profile_string(section, "HOST", conn_setting->host, MAX_SETTING_STRING_LEN, "", mysql_conf)){
-        LOG_ERROR("load conn_setting HOST fail!");
-        goto ERROR;
+int MysqlConnectionPool::initMysqlConnPool(
+        const char* host, 
+        int port, 
+        const char* user, 
+        const char* password, 
+        const char* database){
+    if(NULL == host){
+        MCP_LOG("ERROR: host is NULL");
+        return 1;
     }
-    if(!read_profile_string(section, "DATABASE", conn_setting->database, MAX_SETTING_STRING_LEN, "", mysql_conf)){
-        LOG_ERROR("load conn_setting DATABASE fail!");
-        goto ERROR;
+    if(NULL == user){
+        MCP_LOG("ERROR: user is NULL");
+        return 1;
     }
-    if(!read_profile_string(section, "USER", conn_setting->user, MAX_SETTING_STRING_LEN, "", mysql_conf)){
-        LOG_ERROR("load conn_setting USER fail!");
-        goto ERROR;
+    if(NULL == password){
+        MCP_LOG("ERROR: password is NULL");
+        return 1;
     }
-    if(!read_profile_string(section, "PASSWORD", conn_setting->password, MAX_SETTING_STRING_LEN, "", mysql_conf)){
-        LOG_ERROR("load conn_setting HOST fail!");
-        goto ERROR;
+    if(NULL == database){
+        MCP_LOG("ERROR: database is NULL");
+        return 1;
     }
-    conn_setting->port = read_profile_int(section, "PORT", 3306, mysql_conf);
-conn_setting->timeout = read_profile_int(section, "TIMEOUT", 3, mysql_conf);
-    pool_num = read_profile_int(section, "POOLNUM", 3, mysql_conf);
-    if(connpool_open(pool_num) != 0){
-        LOG_ERROR("create mysql conn pool fail!");
-        free(conn_setting);
-        return -2;
-    }
+    connSetting = (connectionSetting*)malloc(sizeof(connectionSetting));
+    assert(connSetting != NULL);
+    memset(connSetting, 0, sizeof(connectionSetting));
+    strncpy(connSetting->host, host, MAX_SETTING_STRING_LEN);
+    strncpy(connSetting->user, user, MAX_SETTING_STRING_LEN);
+    strncpy(connSetting->password, password, MAX_SETTING_STRING_LEN);
+    connSetting->port = port;
+    strncpy(connSetting->database, database, MAX_SETTING_STRING_LEN);
+    //set the default charset utf-8
+    sprintf(connSetting->charset, "utf8");
+    //set default timeout 2s 
+    connSetting->timeout = 2;
     return 0;
-ERROR:
-    free(conn_setting);
-    return -1;
+}
+
+//set the connection charset
+void MysqlConnectionPool::setCharsetOption(connectionSetting *connSetting, const char* charset){
+    if(NULL != connSetting && NULL != charset){
+        strncpy(connSetting->charset, charset, MAX_SETTING_STRING_LEN);
+    }
 }
